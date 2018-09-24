@@ -1,0 +1,505 @@
+---
+title: "FALL2017 DA5030 Term Project"
+author: "Xing Yang"
+date: "2017/12/6"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(ggplot2)
+library(ggthemes)
+library(parallel)
+library(gridExtra)
+library(tidyverse)
+library(psych)
+library(mice)
+library(zipcode)
+library(h2o)
+library(caret)
+library(ROCR)
+library(h2oEnsemble)
+```
+
+# Data Acquisition
+
+## Insurance Problem 
+
+This dataset is from Kangaroo Auto Insurance Company, an Australian company. The Kangaroo data set is based on 4 years of property insurance policies from 2013 to 2015. There are roughly 5500 policies in the training data and each policy only has one observation. There are almost 2000 policies that were canceled during the effective term.I would like to build a model on the training data and use my best model to predict the cancelation indicator for each policy in test data. 
+
+## Data Description
+
+```{r}
+#this data contain train and test
+full <- read.csv("/Users/xingyang/Desktop/5030/Train.csv", stringsAsFactors = T)
+str(full)
+```
+
+ID: Policy ID
+tenure: Number of years with Kangaroo
+claim.ind: Occurrence of claim (0=no, 1=yes)
+n.adults: Number of adults in the property
+n.children: Number of children in the property
+ni.gender: Gender of policyholder
+ni.marital.status: Marital status of policyholder (0=no, 1=yes)
+premium: Price of the policy
+sales.channel: Medium through which policy was purchased
+coverage.type: Type of coverage
+dwelling.type: Type of dwelling
+len.at.res: Length at residence (how long policyholder lived at property)
+credit: Financial credit level of policyholder
+house.Color: Color of house
+ni.age: Age of policholder
+year: Year of the policy
+zip.code: Zip code of the property
+cancel: cancelation indicator (0=no, 1=yes). This is the response variable and "-1" is invalid value. 
+
+
+# Data exploration
+
+## Exploratory data plots
+
+```{r}
+#delet cancel is '-1' and ID 
+full1 <- full[-1]
+full2 <- full1[!full1$cancel==-1,]
+full2$ni.marital.status <- as.factor(full2$ni.marital.status)
+full2$claim.ind <- as.factor(full2$claim.ind)
+full2$cancel <- as.factor(full2$cancel)
+
+#data visualization
+#frequency funcion
+plot_freq <- function(data, col_name) {
+  data <- data.frame(x = data[, col_name], cancel = data$cancel)
+  freq <- ggplot(data = subset(data, !is.na(x)), aes(x = x, fill = cancel)) + 
+    geom_bar(aes(y = (..count..)/sum(..count..))) + 
+    xlab(col_name) +
+    ylab('frequency') +
+    theme_bw()
+  return(freq)
+}
+#histogram funcion
+plot_hist <- function(data, col_name) {
+  data <- data.frame(x = data[, col_name], cancel = data$cancel)
+  hist <- ggplot(data = subset(data, !is.na(x)), aes(x = x,  fill = cancel)) + 
+    geom_histogram(binwidth = 1) + 
+    xlab(col_name) + 
+    theme_bw()
+  return(hist)
+}
+
+#use grid.arragne to get combine grap
+plots_muti <- function(data, fun, col_names_vector, ncol = 3) {
+  plt_list <- mclapply(col_names_vector, mc.preschedule = TRUE, mc.cores = 8, function(col_name) {
+    plt <- fun(data = data, col_name = col_name)
+  })
+  do.call("grid.arrange", c(plt_list, ncol = ncol))
+}
+
+factorname <- colnames(full2[,sapply(full2, is.factor)])
+numericname <- colnames(full2[, sapply(full2, function(x) !is.factor(x))])
+plots_muti(data = full2, fun = plot_freq, col_names_vector = factorname, ncol = 3)
+#delete zipcode and year, I will convert zipcode to state, too. 
+plots_muti(data = full2, fun = plot_hist, col_names_vector = numericname[c(-7, -8)], ncol = 3)
+```
+
+## Detection of outliers 
+
+```{r}
+summary(full2)
+```
+
+Through comparing the median, mean, maximum and minimum and from above graphs, I think that outlier should exist in the n.adults, n.children, ni.age, and len.at.res.
+
+```{r}
+out <- select(full2, n.adults, n.children, ni.age, len.at.res, tenure)
+sapply(out, boxplot)
+```
+
+From the boxplot, the tenure do not have outliers, the number of n.adult which is larger than 6 would be outlier and n.children is larger than 7. For the ni.age and len.at.res, these that are more than 3 standard deviations from the mean would be the outlier. I let these outliers be NA. 
+
+```{r}
+full2$n.adults[full2$n.adults > 6] <- NA
+full2$n.children[full2$n.children > 7] <- NA
+
+ni.ageupper <- mean(out$ni.age, na.rm = T) + 3*sd(out$ni.age, na.rm = T)
+#make sure the number our outliers are acceptable 
+sum(out$ni.age > ni.ageupper, na.rm = T)
+full2$ni.age[full2$ni.age > ni.ageupper] <- NA
+
+len.at.resupper <- mean(out$len.at.res, na.rm = T) + 3*sd(out$len.at.res, na.rm = T)
+#make sure the number our outliers are acceptable 
+sum(out$len.at.res > len.at.resupper, na.rm = T)
+full2$len.at.res[full2$len.at.res > len.at.resupper] <- NA
+
+#see outcome, should be better than first hist
+plots_muti(data = full2, fun = plot_hist, col_names_vector = c("n.adults", "n.children", "ni.age", "len.at.res"), ncol = 2)
+```
+
+## Correlation
+
+```{r}
+pairs.panels(full2[numericname[c(-7, -8)]])
+```
+
+As we can see, almost all variables do not exist collinearity
+
+
+# Data Cleaning & Shaping
+
+## Data Imputation
+
+```{r}
+#check the number of NA
+sapply(full2, function(x) sum(is.na(x)))
+
+imputation <- mice(full2, m=1, maxit = 50, method = 'cart', printFlag = F, seed = 500)
+fullmice <- complete(imputation)
+
+#check the number of NA
+sapply(fullmice, function(x) sum(is.na(x)))
+
+#compare outcome since the number of NAs of the other variable are small
+plots_muti(data = full2, fun = plot_hist, col_names_vector = c("n.adults", "n.children", "ni.age", "len.at.res"), ncol = 2)
+plots_muti(data = fullmice, fun = plot_hist, col_names_vector = c("n.adults", "n.children", "ni.age", "len.at.res"), ncol = 2)
+```
+
+From above, I think the imputation is good since these variables' distribution almost do not change.
+
+## Feature Engineering
+
+### New Derived Features
+
+Since the Correlation coefficient between the n.adults and n.children is almost equal to zero, so I decide to generate the children proportion. 
+
+```{r}
+#children proportion
+fullmice$cp <- fullmice$n.children / (fullmice$n.children + fullmice$n.adults)
+```
+
+Also, I convet the zipcode to state. 
+
+```{r}
+colnames(fullmice)[which(colnames(fullmice) == "zip.code")] <- "zip"
+data("zipcode")
+new <- merge(fullmice,zipcode,by='zip')
+new$state <- as.factor(new$state)
+newfull <- select(new, -zip, -city, -latitude, -longitude)
+```
+
+### Kmeans
+
+Then, I would like to use Kmeans instead of PCA, since the Kmeans performance is better than PCA. Since this dataset has many of categorical variable. Using all the features makes the similarity between the observations too high and the clustering effect is not good. I firstly use RandomForest to filter the features and extract the overall importance 95% of the importance of variables for clustering.
+
+```{r}
+h2o.init(nthreads = -1)
+
+rf_train <- as.h2o(newfull %>% filter(year != 2016))
+rf_x <- names(newfull)[-c(14, 15)]
+rf_y <- "cancel"
+
+rf <- h2o.randomForest(x = rf_x,
+                       y = rf_y, 
+                       model_id = "rf_features",
+                       training_frame = rf_train,
+                       ntrees = 300,
+                       seed = 1)
+rf_importance <- as.data.frame(rf@model$variable_importances)
+which(cumsum(rf_importance$percentage) > 0.95)[1]
+important_features <- rf_importance$variable[1:which(cumsum(rf_importance$percentage) > 0.95)[1]]
+important_features
+```
+
+So, I woutld use these important_features to cluster, and for the clusting outcome, I want that the cancel disturibution for each cluster should be more of less different if is an ideal clusting.  Also, I would use the full data.
+
+```{r}
+km_train <- as.h2o(newfull)
+
+km <- h2o.kmeans(x = important_features,
+                 training_frame = rf_train,
+                 model_id = "kmeans",
+                 max_iterations = 1000,
+                 k = 6,
+                 seed = 1)
+newfull$km <- as.factor(as.data.frame(predict(km, km_train))[, 1])
+#see performance 
+plot_freq(newfull, "km")
+```
+
+From above, I think the 6 clusters are pretty good, for dummy code, since package which I choose can convert to dummy variable automatically, so I do not do this things. 
+
+## Normalization/Standardization of feature values
+
+```{r}
+normalfull <- newfull
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+normalname <- colnames(normalfull[, sapply(normalfull, function(x) is.numeric(x))])
+normalfull[,normalname[-7]] <- sapply(newfull[,normalname[-7]], normalize)
+```
+
+
+# Model Construction & Evaluation 
+
+## Creation of Training & Validation Subset
+
+```{r}
+#sepearte train and test, for the year, I think we do not need, since we use the past to predict furture, the year is useless and in training data, the year of 2016 did not have. This is also a mistake when we consturted model. 
+train <- normalfull %>% filter(year != 2016) %>% select(-year)
+test <- normalfull %>% filter(year == 2016) %>% select(-year)
+```
+
+## Construction Model 
+
+### Support Vector Machine
+
+The first maching learning algorithm is Support Vector Machine since this dataset has so many categorical variables, so, I think the Support Vector Machine is suitable and the performance should be better. 
+
+```{r}
+#convert to dummy variable first
+svm_train <- as.data.frame(model.matrix(~.,train))[-1]
+svm_test <- as.data.frame(model.matrix(~.,test))[-1]
+
+#generate level
+svm_train$cancel2 <- as.factor(svm_train$cancel2)
+svm_test$cancel2 <- as.factor(svm_test$cancel2)
+levels(svm_train$cancel2) <- make.names(levels(svm_train$cancel2))
+levels(svm_test$cancel2) <- make.names(levels(svm_test$cancel))
+
+set.seed(1492)
+#5-folds cross validation 
+ctrl <- trainControl(method = "cv", 
+                     n = 5,	
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE)
+svm.grid <- expand.grid(sigma = seq(0.1, 0.5, 0.1),
+                        C = seq(0.5, 1.5, 0.2))
+svm <- train(cancel2 ~ .,
+             svm_train,
+             method = "svmRadial",
+             metric = "ROC",
+             preProc = c("center","scale"),
+             trControl = ctrl,
+             tuneGrid = svm.grid)
+svm$bestTune
+svm_prob <- predict(svm, svm_test, type = "prob")
+svm_input <- prediction(svm_prob[,2], svm_test$cancel2)
+
+svm_auc <- performance(svm_input,"auc")@y.values
+svm_accuracy <- mean(predict(svm, svm_test) == svm_test$cancel2)
+
+#plot the ROC curve 
+svm_perf = performance(svm_input, "tpr", "fpr")
+plot(svm_perf, lwd=2, colorize=TRUE, main = "Support Vector Machine")
+lines(x=c(0, 1), y=c(0, 1), col="black", lwd=1)
+text(0.6, 0.43, labels=sprintf("AUC: %0.3f", svm_auc), col="red")
+text(0.6, 0.34, labels=sprintf("Accuracy: %0.3f", svm_accuracy), col="red")
+```
+
+For the SVM, this outcome is a little bad, so I decide use some boosting or tree algorithm.
+
+### Gradient Boosting Machine
+
+```{r}
+x <- names(train)[-15]
+y <- "cancel"
+#cross validation
+nfolds <- 5
+fold_assignment <- "Modulo" 
+
+#splits data into training and validation
+splits <- h2o.splitFrame(
+  data = as.h2o(train),
+  ratios = 0.7,   
+  seed = 1234)
+training <- splits[[1]]
+validation <- splits[[2]]
+testing <- as.h2o(test)
+
+search_criteria = list(
+  strategy = "RandomDiscrete",     
+  max_runtime_secs = 3600,        
+  max_models = 100,                 
+  seed = 1234,                       
+  stopping_rounds = 5,               
+  stopping_metric = "AUC",
+  stopping_tolerance = 1e-4)
+
+hyper_params = list(
+  max_depth = seq(1,10,1),             
+  sample_rate = seq(0.2,1,0.02),                    
+  col_sample_rate = seq(0.2,1,0.02),                
+  col_sample_rate_per_tree = seq(0.2,1,0.02),       
+  col_sample_rate_change_per_level = seq(0.9,1.1,0.02),                     
+  min_rows = 2^seq(0,log2(nrow(training))-1,1),
+  nbins = 2^seq(4,10,1),                            
+  nbins_cats = 2^seq(4,12,1),                       
+  min_split_improvement = c(0,1e-8,1e-6,1e-4),      
+  histogram_type = c("UniformAdaptive","QuantilesGlobal","RoundRobin"),
+  learn_rate = seq(0.001,0.07,0.003),                                
+  learn_rate_annealing = seq(0.8,0.99,0.02))
+
+grid <- h2o.grid(
+  hyper_params = hyper_params,
+  search_criteria = search_criteria,
+  algorithm = "gbm",
+  grid_id = "gbm_grid",
+  x = x,
+  y = y,
+  training_frame = training,
+  validation_frame = validation,
+  ntrees = 10000,                                 
+  distribution = "bernoulli",
+  #dummy code
+  categorical_encoding = "AUTO",
+  nfolds = nfolds,                           
+  fold_assignment = fold_assignment,
+  keep_cross_validation_predictions = TRUE,
+  score_tree_interval = 10,                         
+  seed = 1234)
+
+gbm_grid <- h2o.getGrid("gbm_grid", sort_by = "auc", decreasing = T)
+gbm_grid
+gbm <- h2o.getModel(gbm_grid@model_ids[[1]])
+
+h2o.varimp(gbm)
+h2o.varimp_plot(gbm)
+
+gbm_pred <- h2o.predict(gbm, testing)
+gbm_accuracy <- mean(gbm_pred$predict == testing$cancel)
+gbm_auc <- h2o.auc(h2o.performance(gbm, testing))
+
+gbm_input <- prediction(as.vector(gbm_pred$p1), test$cancel)
+gbm_perf = performance(gbm_input, "tpr", "fpr")
+plot(gbm_perf, lwd=2, colorize=TRUE, main = "Gradient Boosting Machine")
+lines(x=c(0, 1), y=c(0, 1), col="black", lwd=1)
+text(0.6, 0.43, labels=sprintf("AUC: %0.4f", gbm_auc), col="red")
+text(0.6, 0.34, labels=sprintf("Accuracy: %0.4f", gbm_accuracy), col="red")
+plot(gbm, metric = "auc")
+
+```
+
+### Deep Learining
+
+```{r}
+hyper_params <- list(
+  hidden = list(c(25,25), c(30, 30, 30), c(5, 5, 5, 5)),
+  epochs = c(50, 100, 200), 
+  l1 = seq(0,1e-3,1e-6),
+  l2 = seq(0,1e-3,1e-6),
+  rho = c(0.9, 0.95, 0.99),
+  epsilon = c(1e-10, 1e-8, 1e-6, 1e-4),
+  input_dropout_ratio = c(0, 0.05, 0.1, 0.2),
+  max_w2=c(10, 100), 
+  activation=c("Rectifier",
+               "Tanh",
+               "Maxout",
+               "RectifierWithDropout",
+               "MaxoutWithDropout")
+)
+
+dl_random_grid <- h2o.grid(
+  algorithm="deeplearning",
+  grid_id = "dl_grid",
+  training_frame = training,
+  validation_frame = validation, 
+  x=x, 
+  y=y,
+  score_validation_samples=10000, 
+  score_duty_cycle=0.025,         
+  distribution = "bernoulli",
+  hyper_params = hyper_params,
+  nfolds = nfolds,                           
+  fold_assignment = fold_assignment,
+  keep_cross_validation_predictions = TRUE,
+  search_criteria = search_criteria,
+  categorical_encoding = "AUTO", 
+  seed = 1234)  
+
+dl_grid <- h2o.getGrid("dl_grid",sort_by="auc",decreasing=T)
+dl_grid
+dl <- h2o.getModel(dl_grid@model_ids[[1]])
+
+h2o.varimp(dl)
+h2o.varimp_plot(dl)
+
+dl_pred <- h2o.predict(dl, testing)
+dl_accuracy <- mean(dl_pred$predict == testing$cancel)
+dl_auc <- h2o.auc(h2o.performance(dl, testing))
+
+dl_input <- prediction(as.vector(dl_pred$p1), test$cancel)
+dl_perf = performance(dl_input, "tpr", "fpr")
+plot(dl_perf, lwd=2, colorize=TRUE, main = "Deep Learning")
+lines(x=c(0, 1), y=c(0, 1), col="black", lwd=1)
+text(0.6, 0.43, labels=sprintf("AUC: %0.4f", dl_auc), col="red")
+text(0.6, 0.34, labels=sprintf("Accuracy: %0.4f", dl_accuracy), col="red")
+plot(dl, metric = "auc")
+```
+
+## Constructino of Stacked Ensemble Model 
+
+```{r}
+base_models <- list(dl_grid@model_ids[[1]], 
+                    dl_grid@model_ids[[2]], 
+                    dl_grid@model_ids[[3]])
+                    
+ensemble <- h2o.stackedEnsemble(x = x,
+                    y = y,
+                    training_frame = training,
+                    validation_frame = validation,
+                    base_models = base_models)
+
+ensemble_pred <- h2o.predict(ensemble, testing)
+ensemble_accuracy <- mean(ensemble_pred$predict == testing$cancel)
+ensemble_auc <- h2o.auc(h2o.performance(ensemble, testing))
+
+ensemble_input <- prediction(as.vector(ensemble_pred$p1), test$cancel)
+ensemble_perf = performance(ensemble_input, "tpr", "fpr")
+plot(ensemble_perf, lwd=2, colorize=TRUE, main = "Ensemble")
+lines(x=c(0, 1), y=c(0, 1), col="black", lwd=1)
+text(0.6, 0.43, labels=sprintf("AUC: %0.3f", ensemble_auc), col="red")
+text(0.6, 0.35, labels=sprintf("Accuracy: %0.3f", ensemble_accuracy), col="red")
+```
+
+## Comparision of Models
+
+```{r}
+svm_fpr <- svm_perf@x.values[[1]]
+svm_tpr <- svm_perf@y.values[[1]]
+
+gbm_fpr <- gbm_perf@x.values[[1]]
+gbm_tpr <- gbm_perf@y.values[[1]]
+
+dl_fpr <- dl_perf@x.values[[1]]
+dl_tpr <- dl_perf@y.values[[1]]
+
+ensemble_fpr <- ensemble_perf@x.values[[1]]
+ensemble_tpr <- ensemble_perf@y.values[[1]]
+
+compare_roc <- data.frame(tpr=c(svm_tpr, gbm_tpr, dl_tpr, ensemble_tpr),
+                      fpr=c(svm_fpr, gbm_fpr, dl_fpr, ensemble_fpr),
+                      model=c(rep("Support Vector Machine", each = length(svm_tpr)),
+                               rep("Gradient Boosting Machine", each = length(gbm_tpr)),
+                               rep("Deep learning", each = length(dl_tpr)),
+                               rep("Ensemble", each = length(ensemble_tpr))))
+ggplot(aes(fpr, tpr, color = model), data = compare_roc) +
+  geom_line() +
+  geom_segment(aes(x = 0, y = 0 , xend = 1, yend = 1), linetype = 2,col='grey') +
+  xlab('False Positive Rate') +
+  ylab('True Positive Rate') +
+  ggtitle('ROC Curve for Four Models')
+
+print(sprintf("Support Vector Machine AUC: %0.3f", svm_auc))
+print(sprintf("Gradient Boosting Machine AUC: %0.3f", gbm_auc))
+print(sprintf("Deep learning AUC: %0.3f", dl_auc))
+print(sprintf("Ensemble AUC: %0.3f", ensemble_auc))
+print(sprintf("Deep learning Accuracy: %0.3f", dl_accuracy))
+```
+
+From above, comparing ROC curve, except Support Vector Machine，the curve of the other algorithms can not see clearly difference, but from the AUC, the ensemble model is the best one. So my final model is the deep learning model. Actually, from my model, there are so many thing that I can improve such that the method of detected outliers, the method of imputed, the number of clusters and the hyperparater search for Deep Learning. I need to make the ensemble modle more stable. 
+
